@@ -14,7 +14,7 @@
 </div>
 
 ## Quick start
-Build the server and client locally (Certificate pinning enabled in client):
+Build the examples server and client locally (Certificate pinning enabled in client):
 
 ```bash
 # Fedora

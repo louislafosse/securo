@@ -111,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if resp.status() == 401 {
             tracing::info!("{} → Rejected (401)", endpoint);
         } else {
-            tracing::warn!("  ⚠️ {} → Accepted with status {}", endpoint, resp.status());
+            tracing::warn!("{} → Accepted with status {}", endpoint, resp.status());
             all_rejected = false;
         }
     }
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("✅ Exchange tokens correctly rejected on ALL protected endpoints");
         tracing::info!("   This confirms exchange tokens are ONLY valid for /auth endpoint");
     } else {
-        tracing::warn!("⚠️ Some endpoints did not reject the exchange token!");
+        tracing::warn!("Some endpoints did not reject the exchange token!");
     }
     tracing::info!("");
 

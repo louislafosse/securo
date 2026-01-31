@@ -22,10 +22,10 @@ debug = true
 securo = {path = "../securo"}
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-actix-web = { version = "4.10.2", features = ["rustls-0_23"]}
+actix-web = { version = "4.12.1", features = ["rustls-0_23"]}
 tracing = "0.1.41"
-tracing-subscriber = { version="0.3.19", features = ["env-filter", "chrono"] }
-tracing-appender = "0.2.3"
+tracing-subscriber = { version="0.3.22", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2.4"
 uuid = { version = "1.11.0", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-diesel = { version = "2.2", features = ["sqlite"] }
+chrono = { version = "0.4.43", features = ["serde"] }
+diesel = { version = "2.3.6", features = ["sqlite"] }

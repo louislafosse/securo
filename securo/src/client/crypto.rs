@@ -192,7 +192,7 @@ impl SecuroClient {
         // By validating length upfront, we ensure the ciphertext hasn't been tampered with.
         if ciphertext.len() != KYBER_1024_CIPHERTEXT_SIZE {
             tracing::warn!(
-                "⚠️  SECURITY: Invalid Kyber ciphertext length: got {} bytes, expected {} bytes. Possible MITM!",
+                "SECURITY: Invalid Kyber ciphertext length: got {} bytes, expected {} bytes. Possible MITM!",
                 ciphertext.len(),
                 KYBER_1024_CIPHERTEXT_SIZE
             );
@@ -208,7 +208,7 @@ impl SecuroClient {
         
         self.kyber_shared_secret = Some(shared_secret.to_vec());
 
-        linfo!(self.logger, "Kyber-1024 shared secret established");
+        linfo!(self.logger, "Kyber-1024 shared secret established");        
         Ok(())
     }
 
@@ -237,7 +237,9 @@ impl SecuroClient {
         }
     }
 
-    /// Create a shared secret box with the server (uses static secret key)
+    /// Create a shared secret box with the server
+    /// Uses X25519 static key for crypto_box (asymmetric encryption)
+    /// NOTE: Kyber provides post-quantum security via HMAC authentication.
     fn create_box(&self) -> Result<SalsaBox, Box<dyn std::error::Error>> {
         let server_public_key = self.server_public_key.as_ref()
             .ok_or("Server public key not set")?;

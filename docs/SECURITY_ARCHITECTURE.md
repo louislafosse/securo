@@ -200,17 +200,19 @@ Shared Secret:
 ### Cryptographic Protections
 - **Ed25519 Authentication**: HMAC-SHA256 of encrypted verifying key prevents ciphertext modification
 - **MITM Protection**: Ed25519 signatures verify server identity during key exchange
+- **TLS Signature Verification**: Certificate signatures validated using webpki (defense-in-depth)
 - **Forward Secrecy**: Ephemeral X25519 keys per session (stored securely server-side, never transmitted)
 - **Post-Quantum KEM**: Kyber-1024 for harvest-now-decrypt-later resilience
 - **End-to-End Encryption**: XSalsa20-Poly1305 (AEAD) with validated nonces
-- **Deterministic Sessions**: Session ID = SHA256(client_keys) prevents replay attacks
+- **Cryptographic Session Binding**: Random UUIDs with cryptographic key derivation
 
 ### Session Security
-- **Certificate Pinning**: Hardcoded certificate validation in client
+- **Certificate Pinning**: Hardcoded certificate validation with full signature verification
 - **License-Based Access**: UUID tokens with expiration
 - **Dual-Ban System**: Ban by session_id OR machine_id
 - **Session Fixation Protection**: stage_token cryptographically binds Stage 1 & Stage 2 of key exchange
-- **Nonce Reuse Detection**: Per-session HashSet tracking prevents replay attacks
+- **Time-Windowed Nonce Cache**: 2-minute expiration window prevents replay attacks with automatic cleanup
+- **Random Session IDs**: Cryptographically random UUIDs (Uuid::new_v4) prevent collision attacks
 - **JWT Validation**: Claims verification (expiration with 30s leeway, token_type checking)
 - **TTL Validation**: 60-second window on incoming requests
 

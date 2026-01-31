@@ -14,7 +14,9 @@
 
 ## Prelude
 
-**Read [Securoserv](https://github.com/louislafosse/securo/tree/main/securoserv) and [Securoclient](https://github.com/louislafosse/securo/tree/main/securoclient) for exact implementation of Securo**
+**Read [Securoserv](https://github.com/louislafosse/securo/tree/main/securoserv) and [Securoclient](https://github.com/louislafosse/securo/tree/main/securoclient) for exact implementation of Securo.**
+
+**Read this [Example of Implementation](https://github.com/louislafosse/securo/blob/main/securo/examples/authentication.rs) for a short and easy way to implement Securo.**
 
 This crate provides the **cryptographic Impl** for an authentication and communication system.
 It implements a hybrid classical-post-quantum key exchange protocol, session encryption, and certificate pinning to establish secure, authenticated connections between client and server.

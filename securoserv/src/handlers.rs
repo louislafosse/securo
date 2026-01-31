@@ -491,7 +491,7 @@ pub async fn auth(
     // Check if this is the admin bootstrap license - if so, mark the session as admin
     let is_admin = license_key == ADMIN_LICENSE_KEY;
     if is_admin {
-        tracing::warn!("⚠️ Admin session authenticated - marking session as admin");
+        tracing::warn!("Admin session authenticated - marking session as admin");
         admin_sessions.mark_as_admin(session_uuid);
     }
 

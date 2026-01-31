@@ -87,7 +87,7 @@ pub async fn debugger_monitor_task(
                 if let Err(e) = report_debugger_detection(&client, &crypto, &hwid).await {
                     tracing::error!("Failed to report debugger: {}", e);
                 } else {
-                    tracing::warn!("⚠️ Machine ID {} has been banned by server", hwid);
+                    tracing::warn!("Machine ID {} has been banned by server", hwid);
                     tracing::error!("Terminating client due to debugger detection");
                     std::process::exit(1);
                 }
@@ -103,7 +103,7 @@ pub async fn debugger_monitor_task(
                 if let Err(e) = report_debugger_detection(&client, &crypto, &hwid).await {
                     tracing::error!("Failed to report debugger: {}", e);
                 } else {
-                    tracing::warn!("⚠️ Machine ID {} has been banned by server", hwid);
+                    tracing::warn!("Machine ID {} has been banned by server", hwid);
                     tracing::error!("Terminating client due to debugger detection");
                     std::process::exit(1);
                 }

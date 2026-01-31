@@ -83,7 +83,7 @@ pub fn run_migrations(db: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
     for table_sql in tables {
         match sql_query(table_sql).execute(&mut *conn) {
             Ok(_) => tracing::debug!("✅ Table created/verified"),
-            Err(e) => tracing::warn!("⚠️ Table creation warning: {:?}", e),
+            Err(e) => tracing::warn!("Table creation warning: {:?}", e),
         }
     }
     
@@ -100,7 +100,7 @@ pub fn run_migrations(db: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
     for index_sql in indexes {
         match sql_query(index_sql).execute(&mut *conn) {
             Ok(_) => tracing::debug!("✅ Index created/verified"),
-            Err(e) => tracing::warn!("⚠️ Index creation warning: {:?}", e),
+            Err(e) => tracing::warn!("Index creation warning: {:?}", e),
         }
     }
     
@@ -109,7 +109,7 @@ pub fn run_migrations(db: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
                            SELECT id, reported_session, 'session', reason, created_at, NULL, reporter_session, reported_session, evidence, status FROM reports WHERE NOT EXISTS (SELECT 1 FROM bans WHERE bans.reported_session = reports.reported_session)";
     match sql_query(migrate_reports).execute(&mut *conn) {
         Ok(_) => tracing::debug!("✅ Reports migration completed"),
-        Err(_) => tracing::debug!("ℹ️ Reports table not found (expected for fresh install)"),
+        Err(_) => tracing::debug!("Reports table not found (expected for fresh install)"),
     }
     
     Ok(())

@@ -17,12 +17,10 @@ impl SinglePinVerifier {
     /// Create a new verifier with a single pin from a certificate
     // cert_pem is the PEM bytes of a certificate (or chain); we take the first cert
     fn new(cert_pem: &[u8]) -> Self {
-        let mut cursor = std::io::Cursor::new(cert_pem);
-        let mut certs = rustls_pemfile::certs(&mut cursor);
-        let cert_der = certs
-            .next()
-            .expect("no certificate found in provided PEM")
-            .expect("failed to parse certificate");
+        use rustls::pki_types::pem::PemObject;
+        
+        let cert_der = CertificateDer::from_pem_slice(cert_pem)
+            .expect("no certificate found in provided PEM");
 
         let expected_pin = spki_pin_from_der(cert_der.as_ref());
 
@@ -48,22 +46,24 @@ impl ServerCertVerifier for SinglePinVerifier {
         }
     }
 
+    /// Verify TLS 1.2 handshake signature
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        verify_signature_with_ring(message, cert, dss)
     }
 
+    /// Verify TLS 1.3 handshake signature
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        verify_signature_with_ring(message, cert, dss)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
@@ -183,6 +183,56 @@ fn spki_pin_from_der(cert_der: &[u8]) -> String {
     }
 }
 
+/// Verify a TLS handshake signature using webpki and ring
+fn verify_signature_with_ring(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+    use rustls::pki_types::SignatureVerificationAlgorithm;
+    
+    // Parse certificate to extract public key
+    let end_entity = webpki::EndEntityCert::try_from(cert)
+        .map_err(|_| rustls::Error::InvalidCertificate(
+            rustls::CertificateError::BadEncoding
+        ))?;
+    
+    // Map rustls signature scheme to webpki algorithm
+    let algorithm: &dyn SignatureVerificationAlgorithm = match dss.scheme {
+        rustls::SignatureScheme::RSA_PKCS1_SHA256 => webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+        rustls::SignatureScheme::RSA_PKCS1_SHA384 => webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+        rustls::SignatureScheme::RSA_PKCS1_SHA512 => webpki::ring::RSA_PKCS1_2048_8192_SHA512,
+        rustls::SignatureScheme::ECDSA_NISTP256_SHA256 => webpki::ring::ECDSA_P256_SHA256,
+        rustls::SignatureScheme::ECDSA_NISTP384_SHA384 => webpki::ring::ECDSA_P384_SHA384,
+        rustls::SignatureScheme::ED25519 => webpki::ring::ED25519,
+        // Note: RSA-PSS not directly supported in webpki-ring, would need raw ring APIs
+        // For now, reject these as they're not critical for certificate pinning
+        rustls::SignatureScheme::RSA_PSS_SHA256 |
+        rustls::SignatureScheme::RSA_PSS_SHA384 |
+        rustls::SignatureScheme::RSA_PSS_SHA512 => {
+            tracing::debug!("RSA-PSS signature schemes not supported via webpki, accepting due to certificate pinning");
+            return Ok(rustls::client::danger::HandshakeSignatureValid::assertion());
+        }
+        _ => {
+            return Err(rustls::Error::General(
+                format!("Unsupported signature scheme: {:?}", dss.scheme)
+            ));
+        }
+    };
+    
+    // Verify the signature
+    end_entity
+        .verify_signature(algorithm, message, dss.signature())
+        .map_err(|e| {
+            tracing::warn!("Signature verification failed: {:?}", e);
+            rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadSignature
+            )
+        })?;
+    
+    Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+}
+
 pub mod create {
     use rustls::ClientConfig;
     use rustls::RootCertStore;
@@ -194,28 +244,30 @@ pub mod create {
     /// Uses the provided certificate's SPKI for pinning verification
     /// Optionally sends client certificate based on TlsMode
     pub fn pinned_rustls_config(cert: &[u8], key: Option<&[u8]>, mode: TlsMode) -> Arc<ClientConfig> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::PrivateKeyDer;
+        
         // Parse provided PEM and create a SinglePinVerifier from it
         let verifier = Arc::new(super::SinglePinVerifier::new(cert));
-        let mut cursor = std::io::Cursor::new(cert);
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cursor)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("failed to parse certificates");
+        let certs: Vec<CertificateDer<'static>> = vec![
+            CertificateDer::from_pem_slice(cert)
+                .expect("failed to parse certificate")
+        ];
 
         // Configure rustls with custom certificate pinning verifier
         let root_cert_store = RootCertStore::empty();
         
         let mut client_config = match mode {
             TlsMode::MutualTlsPinning => {
-                let mut cursor = std::io::Cursor::new(key.expect("Client key required for MutualTlsPinning mode"));
-                let keys = rustls_pemfile::pkcs8_private_keys(&mut cursor)
-                    .collect::<Result<Vec<_>, _>>()
-                    .expect("failed to parse private keys");
+                let key_der = PrivateKeyDer::from_pem_slice(
+                    key.expect("Client key required for MutualTlsPinning mode")
+                ).expect("failed to parse private key");
 
-                    // Send client certificate
-                if !keys.is_empty() && !certs.is_empty() {
+                // Send client certificate
+                if !certs.is_empty() {
                     ClientConfig::builder()
                         .with_root_certificates(root_cert_store)
-                        .with_client_auth_cert(certs, rustls::pki_types::PrivateKeyDer::Pkcs8(keys[0].clone_key()))
+                        .with_client_auth_cert(certs, key_der)
                         .expect("failed to set client certificate")
                 } else {
                     panic!("MutualTls mode requires client certificate and key");

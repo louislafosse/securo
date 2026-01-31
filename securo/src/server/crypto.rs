@@ -17,6 +17,7 @@ use sha2::{
     Digest,
 };
 use hmac::Mac;
+use std::time::Instant;
 use crate::logger::{
     linfo,
     ldebug
@@ -25,6 +26,61 @@ use crate::logger::{
         
 
 const KYBER_1024_CIPHERTEXT_SIZE: usize = 1568;  // Kyber-1024 encapsulation produces exactly 1568 bytes
+const NONCE_MAX_AGE_SECS: u64 = 120; // 2 minutes
+const NONCE_CACHE_MAX_SIZE: usize = 10000;
+
+/// Time-windowed nonce cache with automatic cleanup
+#[derive(Clone)]
+pub struct NonceCache {
+    nonces: std::collections::HashMap<String, Instant>,
+}
+
+impl NonceCache {
+    fn new() -> Self {
+        Self {
+            nonces: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// Check if nonce exists and is not expired, then add it
+    /// Returns true if nonce is fresh (not replayed), false if replayed
+    fn check_and_insert(&mut self, nonce: &str) -> bool {
+        self.cleanup_expired();
+        
+        // Check if nonce already exists
+        if self.nonces.contains_key(nonce) {
+            return false; // REPLAY DETECTED
+        }
+        
+        // Prevent unbounded growth
+        if self.nonces.len() >= NONCE_CACHE_MAX_SIZE {
+            tracing::warn!("Nonce cache size limit reached, forcing cleanup");
+            self.cleanup_expired();
+            
+            // If still full after cleanup, remove oldest entries
+            if self.nonces.len() >= NONCE_CACHE_MAX_SIZE {
+                let to_remove: Vec<String> = self.nonces.iter()
+                    .take(NONCE_CACHE_MAX_SIZE / 4)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for key in to_remove {
+                    self.nonces.remove(&key);
+                }
+            }
+        }
+        
+        self.nonces.insert(nonce.to_string(), Instant::now());
+        true
+    }
+    
+    /// Remove expired nonces
+    fn cleanup_expired(&mut self) {
+        let now = Instant::now();
+        self.nonces.retain(|_, timestamp| {
+            now.duration_since(*timestamp).as_secs() < NONCE_MAX_AGE_SECS
+        });
+    }
+}
 
 /// JWT Claims for session authentication (OAuth2-style)
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -149,7 +205,7 @@ pub struct PendingExchange {
 pub struct SessionData {
     pub public_key: PublicKey,
     pub last_heartbeat: u64,  // Unix timestamp in seconds
-    pub used_nonces: std::collections::HashSet<String>,  // Track used nonces to prevent replay attacks
+    pub used_nonces: NonceCache,  // Time-windowed nonce cache to prevent replay attacks
 }
 
 
@@ -215,10 +271,10 @@ impl ServerError {
                 tracing::error!("Session not found - unknown or expired UUID");
             }
             ServerError::InvalidSignature => {
-                tracing::warn!("⚠️  SECURITY: Invalid signature detected - possible MITM attack!");
+                tracing::warn!("SECURITY: Invalid signature detected - possible MITM attack!");
             }
             ServerError::InvalidProof => {
-                tracing::warn!("⚠️  SECURITY: Invalid proof of possession - possible MITM attack!");
+                tracing::warn!("SECURITY: Invalid proof of possession - possible MITM attack!");
             }
             _ => {
                 tracing::error!("Crypto error: {}", self);
@@ -384,7 +440,7 @@ impl SecuroServ {
             let mut exchanges = self.pending_exchanges.write().unwrap();
             exchanges.remove(&req.stage_token)
                 .ok_or_else(|| {
-                    tracing::warn!("⚠️  SECURITY: Stage 2 request with invalid/missing stage_token - possible session fixation attack!");
+                    tracing::warn!("SECURITY: Stage 2 request with invalid/missing stage_token - possible session fixation attack!");
                     ServerError::InvalidProof
                 })?
         };
@@ -514,16 +570,27 @@ impl SecuroServ {
         sig_message.extend_from_slice(server_ephemeral_public.as_bytes());
         let server_signature = self.sign_data(&sig_message);
         
-        // Create session deterministically from client keys
         let mut hasher = sha2::Sha256::new();
         hasher.update(b"securoserv-session");
         hasher.update(&client_x25519_bytes);
         hasher.update(&client_verifying_bytes);
-        let session_hash = hasher.finalize();
         
+        // Add random nonce for uniqueness
+        let mut random_nonce = [0u8; 16];
+        OsRng.fill_bytes(&mut random_nonce);
+        hasher.update(random_nonce);
+        
+        // Add timestamp for additional entropy
+        let now_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        hasher.update(now_nanos.to_le_bytes());
+        
+        let session_hash = hasher.finalize();
         let session_uuid = Uuid::from_slice(&session_hash[..16])
             .map_err(|_| ServerError::InvalidSession)?;
-        
+                
         // Store session
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -533,13 +600,14 @@ impl SecuroServ {
         let session_data = SessionData {
             public_key: client_public_key.clone(),
             last_heartbeat: now,
-            used_nonces: std::collections::HashSet::new(),
+            used_nonces: NonceCache::new(),
         };
         
         let mut sessions = self.sessions.write().unwrap();
         sessions.insert(session_uuid, session_data);
 
         // Encrypt server's Ed25519 verifying key with client's public key
+        // NOTE: Using X25519 directly here. Kyber provides additional authentication via HMAC.
         let salsa_box = self.create_box_with_client(&client_public_key);
         let nonce = SalsaBox::generate_nonce(&mut OsRng);
         let verifying_key_bytes = self.verifying_key.as_bytes();
@@ -567,7 +635,7 @@ impl SecuroServ {
             // Any deviation indicates a bug in the library or potential tampering
             if ciphertext.len() != KYBER_1024_CIPHERTEXT_SIZE {
                 tracing::error!(
-                    "⚠️  SECURITY: Kyber encapsulation produced invalid ciphertext length: {} (expected {})",
+                    "SECURITY: Kyber encapsulation produced invalid ciphertext length: {} (expected {})",
                     ciphertext.len(),
                     KYBER_1024_CIPHERTEXT_SIZE
                 );
@@ -831,9 +899,9 @@ impl SecuroServ {
         let session_data = sessions.get_mut(&session_uuid)
             .ok_or(ServerError::SessionNotFound)?;
 
-        // Check for nonce reuse
-        if session_data.used_nonces.contains(&req.nonce) {
-            tracing::warn!("Nonce reuse detected in encrypted request - rejecting");
+        // Check for nonce reuse with time-windowed cache
+        if !session_data.used_nonces.check_and_insert(&req.nonce) {
+            tracing::warn!("SECURITY: Nonce reuse detected - possible replay attack!");
             return Err(ServerError::InvalidNonce);
         }
         
@@ -841,9 +909,6 @@ impl SecuroServ {
         let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
         let plaintext = salsa_box.decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| ServerError::DecryptionFailed)?;
-
-        // Mark nonce as used
-        session_data.used_nonces.insert(req.nonce.clone());
 
         let plaintext_str = String::from_utf8(plaintext)
             .map_err(|_| ServerError::DecryptionFailed)?;
@@ -901,9 +966,9 @@ impl SecuroServ {
         let session_data = sessions.get_mut(&session_uuid)
             .ok_or(ServerError::SessionNotFound)?;
 
-        // Check for nonce reuse
-        if session_data.used_nonces.contains(&req.nonce) {
-            tracing::warn!("Nonce reuse detected in encrypted request - rejecting");
+        // Check for nonce reuse with time-windowed cache
+        if !session_data.used_nonces.check_and_insert(&req.nonce) {
+            tracing::warn!("SECURITY: Nonce reuse detected - possible replay attack!");
             return Err(ServerError::InvalidNonce);
         }
         
@@ -911,9 +976,6 @@ impl SecuroServ {
         let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
         let plaintext = salsa_box.decrypt(&nonce, ciphertext.as_ref())
             .map_err(|_| ServerError::DecryptionFailed)?;
-
-        // Mark nonce as used
-        session_data.used_nonces.insert(req.nonce.clone());
 
         let plaintext_str = String::from_utf8(plaintext)
             .map_err(|_| ServerError::DecryptionFailed)?;
@@ -978,6 +1040,59 @@ impl SecuroServ {
             signature,
             timestamp,
         })
+    }
+    
+    /// Clean up expired pending exchanges (older than 5 minutes)
+    /// Should be called periodically by the server
+    pub fn cleanup_expired_pending_exchanges(&self) {
+        const PENDING_EXCHANGE_TTL_SECS: u64 = 300; // 5 minutes
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let mut exchanges = self.pending_exchanges.write().unwrap();
+        let initial_count = exchanges.len();
+        
+        exchanges.retain(|_token, pending| {
+            let age = now.saturating_sub(pending.created_at);
+            age < PENDING_EXCHANGE_TTL_SECS
+        });
+        
+        let removed = initial_count - exchanges.len();
+        if removed > 0 {
+            linfo!(self.logger, "Cleaned up {} expired pending exchanges", removed);
+        }
+    }
+    
+    /// Get count of pending exchanges (for monitoring)
+    pub fn get_pending_exchanges_count(&self) -> usize {
+        self.pending_exchanges.read().unwrap().len()
+    }
+    
+    /// Clean up expired sessions (no heartbeat for > 1 hour)
+    /// Should be called periodically by the server
+    pub fn cleanup_expired_sessions(&self) {
+        const SESSION_TIMEOUT_SECS: u64 = 3600; // 1 hour
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        
+        let mut sessions = self.sessions.write().unwrap();
+        let initial_count = sessions.len();
+        
+        sessions.retain(|_uuid, session| {
+            let age = now.saturating_sub(session.last_heartbeat);
+            age < SESSION_TIMEOUT_SECS
+        });
+        
+        let removed = initial_count - sessions.len();
+        if removed > 0 {
+            linfo!(self.logger, "Cleaned up {} expired sessions", removed);
+        }
     }
 }
 
