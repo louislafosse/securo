@@ -13,7 +13,7 @@
 //! ## Core Features
 //!
 //! 1. **Hybrid Key Exchange** — X25519 + Kyber-1024 (post-quantum KEM)
-//! 2. **AEAD Encryption** — XSalsa20-Poly1305 for message payloads
+//! 2. **AEAD Encryption** — ChaCha20-Poly1305 for message payloads (protocol v2)
 //! 3. **Signatures** — Ed25519 for authentication, HMAC-SHA256 for integrity
 //! 4. **Certificate Pinning** — TLS with hardcoded certificate validation
 //! 5. **Session Management** — JWT tokens with access/refresh pattern

@@ -11,6 +11,7 @@ use actix_web::{
 use securo::server::pin::init_rustls_config;
 use securo::server::crypto::SecuroServ;
 use securo::tls::TlsMode;
+use std::time::Duration;
 
 use actix_web::web::{self};
 use crate::admin::AdminSessions;
@@ -85,8 +86,8 @@ async fn main() -> std::io::Result<()> {
     tracing::info!("Database initialized");
 
     // Create the server crypto instance with tracing logger
-    let server_crypto = web::Data::new(
-        SecuroServ::new_with_verbose()
+    let server_crypto = web::Data::from(
+        SecuroServ::new_with_verbose_housekeeping(Duration::from_secs(60))
     );
 
     let db_data = web::Data::new(db_pool);

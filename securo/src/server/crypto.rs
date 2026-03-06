@@ -1,23 +1,32 @@
 use crypto_box::{
     PublicKey, SalsaBox, SecretKey, aead::{Aead, AeadCore, OsRng}
 };
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    Nonce as ChaNonce,
+    aead::{KeyInit, Payload},
+};
 use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE};
 use std::collections::HashMap;
-use std::sync::RwLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc,
+    RwLock,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use jsonwebtoken::{encode, decode, Header, Validation, EncodingKey, DecodingKey, Algorithm};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signer};
-use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey};
+use x25519_dalek::{EphemeralSecret, PublicKey as X25519PublicKey, StaticSecret};
 use pqc_kyber::{RngCore, encapsulate};
+use hkdf::Hkdf;
 use hmac::Hmac;
 use sha2::{
     Sha256,
     Digest,
 };
 use hmac::Mac;
-use std::time::Instant;
 use crate::logger::{
     linfo,
     ldebug
@@ -59,9 +68,13 @@ impl NonceCache {
             
             // If still full after cleanup, remove oldest entries
             if self.nonces.len() >= NONCE_CACHE_MAX_SIZE {
-                let to_remove: Vec<String> = self.nonces.iter()
+                let mut entries: Vec<(String, Instant)> = self.nonces.iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                entries.sort_by_key(|(_, ts)| *ts);
+                let to_remove: Vec<String> = entries.into_iter()
                     .take(NONCE_CACHE_MAX_SIZE / 4)
-                    .map(|(k, _)| k.clone())
+                    .map(|(k, _)| k)
                     .collect();
                 for key in to_remove {
                     self.nonces.remove(&key);
@@ -114,7 +127,7 @@ pub struct EncryptedMessage {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EncryptedRequest {
     pub session_id: String,         // Client's session UUID - for O(1) lookup
-    pub nonce: String,              // 24 random bytes
+    pub nonce: String,              // 12 random bytes (ChaCha20Poly1305)
     pub ciphertext: String,         // contains encrypted JSON payload
     pub timestamp: i64,
 }
@@ -122,7 +135,7 @@ pub struct EncryptedRequest {
 /// Server responds with encrypted data that client must decrypt
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct EncryptedResponse {
-    pub nonce: String,              // 24 random bytes
+    pub nonce: String,              // 12 random bytes (ChaCha20Poly1305)
     pub ciphertext: String,         // contains encrypted JSON response
     pub signature: String,          // Ed25519 signature over (nonce || ciphertext)
     pub timestamp: i64,
@@ -206,6 +219,7 @@ pub struct SessionData {
     pub public_key: PublicKey,
     pub last_heartbeat: u64,  // Unix timestamp in seconds
     pub used_nonces: NonceCache,  // Time-windowed nonce cache to prevent replay attacks
+    pub session_key: [u8; 32],    // Hybrid-derived session key for ChaCha20Poly1305
 }
 
 
@@ -300,6 +314,8 @@ pub struct SecuroServ {
     ephemeral_secrets: RwLock<HashMap<String, Vec<u8>>>,  // ephemeral_public_b64 -> ephemeral_secret_bytes
     // Pending exchanges - tracks Stage 1 data to validate in Stage 2 (prevents session fixation)
     pending_exchanges: RwLock<HashMap<String, PendingExchange>>,  // stage_token -> PendingExchange
+    // Guard to ensure housekeeping loop starts only once per SecuroServ instance.
+    cleanup_started: AtomicBool,
     logger: crate::logger::LoggerHandle,
 }
 
@@ -312,6 +328,14 @@ impl SecuroServ {
     /// Create a new SecuroServ with verbose logging
     pub fn new_with_verbose() -> Self {
         Self::new_with_logger(crate::logger::LoggerHandle::tracing())
+    }
+
+    /// Create a verbose SecuroServ and immediately start periodic housekeeping.
+    /// Returns `Arc<Self>` for easy integration with runtime frameworks.
+    pub fn new_with_verbose_housekeeping(interval: Duration) -> Arc<Self> {
+        let server = Arc::new(Self::new_with_verbose());
+        server.start_periodic_housekeeping(interval);
+        server
     }
 
     /// Create a new SecuroServ with a custom logger
@@ -345,7 +369,34 @@ impl SecuroServ {
             jwt_secret,
             ephemeral_secrets: RwLock::new(HashMap::new()),
             pending_exchanges: RwLock::new(HashMap::new()),
+            cleanup_started: AtomicBool::new(false),
             logger,
+        }
+    }
+
+    /// Start background housekeeping for pending exchanges and stale sessions.
+    /// Safe to call multiple times; only the first call starts the worker.
+    pub fn start_periodic_housekeeping(self: &Arc<Self>, interval: Duration) {
+        if self.cleanup_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let sleep_interval = if interval.is_zero() {
+            Duration::from_secs(1)
+        } else {
+            interval
+        };
+
+        let cleanup_crypto = Arc::clone(self);
+        if let Err(err) = std::thread::Builder::new()
+            .name("securo-housekeeping".to_string())
+            .spawn(move || loop {
+                cleanup_crypto.cleanup_expired_pending_exchanges();
+                cleanup_crypto.cleanup_expired_sessions();
+                std::thread::sleep(sleep_interval);
+            }) {
+            self.cleanup_started.store(false, Ordering::Release);
+            tracing::error!("Failed to start securo housekeeping thread: {}", err);
         }
     }
 
@@ -402,7 +453,7 @@ impl SecuroServ {
         token_message.extend_from_slice(b"||");
         token_message.extend_from_slice(now.to_le_bytes().as_ref());
         
-        let mut hmac = Hmac::<Sha256>::new_from_slice(self.verifying_key.as_bytes())
+        let mut hmac = <Hmac<Sha256> as Mac>::new_from_slice(self.jwt_secret.as_bytes())
             .map_err(|_| ServerError::EncryptionFailed)?;
         hmac.update(&token_message);
         let stage_token = BASE64_URL_SAFE.encode(hmac.finalize().into_bytes());
@@ -433,6 +484,7 @@ impl SecuroServ {
     /// Stage 2 of secure exchange - Process client's encrypted keys and complete exchange
     pub fn perform_exchange_stage2(&self, req: ExchangeStage2Request) -> Result<ExchangeStage2Response, ServerError> {
         linfo!(self.logger, "Exchange Stage 2: Processing client's encrypted keys");
+        const STAGE2_TOKEN_MAX_AGE_SECS: u64 = 300;
         
         // VALIDATION: Check that stage_token is valid (prevents session fixation)
         // This also retrieves the stored ephemeral secret from Stage 1
@@ -445,7 +497,20 @@ impl SecuroServ {
                 })?
         };
 
-        ldebug!(self.logger, "Stage token validated - Stage 1 and Stage 2 are bound together");
+        // Enforce freshness on stage tokens even if periodic cleanup hasn't run yet.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_age = now.saturating_sub(pending.created_at);
+        if token_age > STAGE2_TOKEN_MAX_AGE_SECS {
+            tracing::warn!(
+                "SECURITY: Expired stage_token rejected (age: {}s, max: {}s)",
+                token_age,
+                STAGE2_TOKEN_MAX_AGE_SECS
+            );
+            return Err(ServerError::InvalidProof);
+        }
         
         // Extract the ephemeral secret that was stored in Stage 1
         let ephemeral_secret_bytes = pending.ephemeral_secret;
@@ -516,11 +581,12 @@ impl SecuroServ {
             client_kyber_public,
         };
         
-        let exchange_response = self.perform_exchange(exchange_req)?;
+        let exchange_response = self.perform_exchange_internal(exchange_req, Some(&ephemeral_array))?;
         
         // Encrypt the response using the same ephemeral shared secret
         let response_payload = serde_json::json!({
             "encrypted_verifying_key": exchange_response.encrypted_verifying_key,
+            "verifying_key_hmac": exchange_response.verifying_key_hmac,
             "kyber_ciphertext": exchange_response.kyber_ciphertext,
             "temp_jwt": exchange_response.temp_jwt,
             "expires_in": exchange_response.expires_in,
@@ -543,6 +609,14 @@ impl SecuroServ {
 
     /// Complete exchange with authentication - returns tokens immediately
     pub fn perform_exchange(&self, req: ExchangeRequest) -> Result<ExchangeResponse, ServerError> {
+        self.perform_exchange_internal(req, None)
+    }
+
+    fn perform_exchange_internal(
+        &self,
+        req: ExchangeRequest,
+        stage1_ephemeral_secret: Option<&[u8; 32]>,
+    ) -> Result<ExchangeResponse, ServerError> {
         linfo!(self.logger, "Starting authenticated key exchange");
 
         // Parse and validate client keys
@@ -552,6 +626,11 @@ impl SecuroServ {
             .map_err(|_| ServerError::InvalidKey)?;
         
         if client_x25519_bytes.len() != 32 {
+            return Err(ServerError::InvalidKey);
+        }
+
+        if req.client_kyber_public.is_empty() {
+            tracing::warn!("SECURITY: Missing Kyber public key in exchange request");
             return Err(ServerError::InvalidKey);
         }
         
@@ -590,21 +669,6 @@ impl SecuroServ {
         let session_hash = hasher.finalize();
         let session_uuid = Uuid::from_slice(&session_hash[..16])
             .map_err(|_| ServerError::InvalidSession)?;
-                
-        // Store session
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        let session_data = SessionData {
-            public_key: client_public_key.clone(),
-            last_heartbeat: now,
-            used_nonces: NonceCache::new(),
-        };
-        
-        let mut sessions = self.sessions.write().unwrap();
-        sessions.insert(session_uuid, session_data);
 
         // Encrypt server's Ed25519 verifying key with client's public key
         // NOTE: Using X25519 directly here. Kyber provides additional authentication via HMAC.
@@ -620,53 +684,57 @@ impl SecuroServ {
         encrypted_with_nonce.extend_from_slice(&nonce[..]);
         encrypted_with_nonce.extend_from_slice(&encrypted_verifying_key);
         
-        // POST-QUANTUM KEY ENCAPSULATION: Kyber-1024
-        // Parse client's Kyber public key if provided
-        let (kyber_ciphertext, kyber_shared_secret) = if !req.client_kyber_public.is_empty() {
-            let client_kyber_pub_bytes = BASE64_URL_SAFE.decode(&req.client_kyber_public)
-                .map_err(|_| ServerError::InvalidKey)?;
-            
-            // Encapsulate with client's Kyber public key
-            let mut rng = OsRng;
-            let (ciphertext, shared_secret) = encapsulate(&client_kyber_pub_bytes, &mut rng)
-                .map_err(|_| ServerError::EncryptionFailed)?;
-            
-            // Kyber-1024 encapsulation MUST produce exactly 1568 bytes
-            // Any deviation indicates a bug in the library or potential tampering
-            if ciphertext.len() != KYBER_1024_CIPHERTEXT_SIZE {
-                tracing::error!(
-                    "SECURITY: Kyber encapsulation produced invalid ciphertext length: {} (expected {})",
-                    ciphertext.len(),
-                    KYBER_1024_CIPHERTEXT_SIZE
-                );
-                return Err(ServerError::EncryptionFailed);
-            }
+        let client_kyber_pub_bytes = BASE64_URL_SAFE.decode(&req.client_kyber_public)
+            .map_err(|_| ServerError::InvalidKey)?;
 
-            ldebug!(self.logger, "Kyber-1024 encapsulation produced valid {} byte ciphertext", KYBER_1024_CIPHERTEXT_SIZE);
+        // POST-QUANTUM KEY ENCAPSULATION: Kyber-1024 (required)
+        let mut rng = OsRng;
+        let (kyber_ciphertext_bytes, kyber_shared_secret) = encapsulate(&client_kyber_pub_bytes, &mut rng)
+            .map_err(|_| ServerError::EncryptionFailed)?;
 
-            // Return the ciphertext for the client to decapsulate
-            // shared_secret will be used for HMAC authentication of verifying_key
-            (BASE64_URL_SAFE.encode(ciphertext), Some(shared_secret.to_vec()))
-        } else {
-            (String::new(), None)
+        if kyber_ciphertext_bytes.len() != KYBER_1024_CIPHERTEXT_SIZE {
+            tracing::error!(
+                "SECURITY: Kyber encapsulation produced invalid ciphertext length: {} (expected {})",
+                kyber_ciphertext_bytes.len(),
+                KYBER_1024_CIPHERTEXT_SIZE
+            );
+            return Err(ServerError::EncryptionFailed);
+        }
+
+        let kyber_ciphertext = BASE64_URL_SAFE.encode(kyber_ciphertext_bytes);
+        let kyber_shared_secret = kyber_shared_secret.to_vec();
+
+        let session_key = self.derive_hybrid_session_key(
+            &client_public_key,
+            &kyber_shared_secret,
+            stage1_ephemeral_secret,
+        )?;
+
+        // Store session with the hybrid-derived session key
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session_data = SessionData {
+            public_key: client_public_key.clone(),
+            last_heartbeat: now,
+            used_nonces: NonceCache::new(),
+            session_key,
         };
+
+        let mut sessions = self.sessions.write().unwrap();
+        sessions.insert(session_uuid, session_data);
         
-        // Compute HMAC of encrypted_verifying_key using Kyber shared secret (if available)
-        let verifying_key_hmac = if let Some(ref kyber_ss) = kyber_shared_secret {
-            let mut mac = Hmac::<Sha256>::new_from_slice(kyber_ss)
-                .map_err(|_| ServerError::EncryptionFailed)?;
-            mac.update(&encrypted_with_nonce);
-            BASE64_URL_SAFE.encode(mac.finalize().into_bytes())
-        } else {
-            String::new()
-        };
+        // Compute HMAC of encrypted_verifying_key using Kyber shared secret
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&kyber_shared_secret)
+            .map_err(|_| ServerError::EncryptionFailed)?;
+        mac.update(&encrypted_with_nonce);
+        let verifying_key_hmac = BASE64_URL_SAFE.encode(mac.finalize().into_bytes());
         
         // Generate temporary token for key exchange phase (10 min)
         let temp_jwt = self.generate_temp_jwt(&session_uuid)?;
 
         linfo!(self.logger, "Session created: {}", session_uuid);
-        linfo!(self.logger, "Post-quantum Kyber-1024 KEM completed");
-        linfo!(self.logger, "Ed25519 verifying key authenticated with HMAC-SHA256");
 
         Ok(ExchangeResponse {
             server_public_key: self.get_public_key_base64(),
@@ -819,17 +887,6 @@ impl SecuroServ {
         Err(ServerError::InvalidSession)
     }
 
-    /// Get a client's public key by session ID
-    fn get_client_key(&self, session_id: &str) -> Result<PublicKey, ServerError> {
-        let uuid = Uuid::parse_str(session_id)
-            .map_err(|_| ServerError::InvalidSession)?;
-        
-        let sessions = self.sessions.read().unwrap();
-        sessions.get(&uuid)
-            .map(|data| data.public_key.clone())
-            .ok_or(ServerError::SessionNotFound)
-    }
-
     /// Unauth a client session
     pub fn unauth(&self, session_id: &str) -> Result<(), ServerError> {
         let uuid = Uuid::parse_str(session_id)
@@ -854,6 +911,40 @@ impl SecuroServ {
     /// Create a shared secret box with a client
     fn create_box_with_client(&self, client_public_key: &PublicKey) -> SalsaBox {
         SalsaBox::new(client_public_key, &self.secret_key)
+    }
+
+    /// Derive protocol-v2 session key using HKDF(X25519 || Kyber-1024).
+    fn derive_hybrid_session_key(
+        &self,
+        client_public_key: &PublicKey,
+        kyber_shared_secret: &[u8],
+        stage1_ephemeral_secret: Option<&[u8; 32]>,
+    ) -> Result<[u8; 32], ServerError> {
+        let static_secret = StaticSecret::from(self.secret_key.to_bytes());
+        let client_x25519_pub = X25519PublicKey::from(*client_public_key.as_bytes());
+        let static_shared = static_secret.diffie_hellman(&client_x25519_pub);
+
+        let mut combined_secret = Vec::with_capacity(
+            static_shared.as_bytes().len()
+                + stage1_ephemeral_secret.map_or(0, |_| 32)
+                + kyber_shared_secret.len(),
+        );
+        combined_secret.extend_from_slice(static_shared.as_bytes());
+
+        if let Some(ephemeral_secret_bytes) = stage1_ephemeral_secret {
+            let ephemeral_secret = StaticSecret::from(*ephemeral_secret_bytes);
+            let ephemeral_shared = ephemeral_secret.diffie_hellman(&client_x25519_pub);
+            combined_secret.extend_from_slice(ephemeral_shared.as_bytes());
+        }
+
+        combined_secret.extend_from_slice(kyber_shared_secret);
+
+        let hkdf = Hkdf::<Sha256>::new(Some(b"securo-v2-session"), &combined_secret);
+        let mut session_key = [0u8; 32];
+        hkdf.expand(b"chacha20-encryption", &mut session_key)
+            .map_err(|_| ServerError::EncryptionFailed)?;
+
+        Ok(session_key)
     }
 
     /// Decrypt an encrypted request
@@ -885,13 +976,9 @@ impl SecuroServ {
         let ciphertext = BASE64_URL_SAFE.decode(&req.ciphertext)
             .map_err(|_| ServerError::InvalidCiphertext)?;
 
-        if nonce_bytes.len() != 24 {
+        if nonce_bytes.len() != 12 {
             return Err(ServerError::InvalidNonce);
         }
-
-        let mut nonce_array = [0u8; 24];
-        nonce_array.copy_from_slice(&nonce_bytes);
-        let nonce = crypto_box::Nonce::from(nonce_array);
 
         let mut sessions = self.sessions.write()
             .map_err(|_| ServerError::InvalidSession)?;
@@ -905,9 +992,16 @@ impl SecuroServ {
             return Err(ServerError::InvalidNonce);
         }
         
-        // Decrypt with the session's client key
-        let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
-        let plaintext = salsa_box.decrypt(&nonce, ciphertext.as_ref())
+        let cipher = ChaCha20Poly1305::new_from_slice(&session_data.session_key)
+            .map_err(|_| ServerError::DecryptionFailed)?;
+        let mut nonce_array = [0u8; 12];
+        nonce_array.copy_from_slice(&nonce_bytes);
+        let nonce = ChaNonce::from(nonce_array);
+        let ts_aad = req.timestamp.to_le_bytes();
+        let plaintext = cipher.decrypt(&nonce, Payload {
+            msg: ciphertext.as_ref(),
+            aad: &ts_aad,
+        })
             .map_err(|_| ServerError::DecryptionFailed)?;
 
         let plaintext_str = String::from_utf8(plaintext)
@@ -952,13 +1046,9 @@ impl SecuroServ {
         let ciphertext = BASE64_URL_SAFE.decode(&req.ciphertext)
             .map_err(|_| ServerError::InvalidCiphertext)?;
 
-        if nonce_bytes.len() != 24 {
+        if nonce_bytes.len() != 12 {
             return Err(ServerError::InvalidNonce);
         }
-
-        let mut nonce_array = [0u8; 24];
-        nonce_array.copy_from_slice(&nonce_bytes);
-        let nonce = crypto_box::Nonce::from(nonce_array);
 
         let mut sessions = self.sessions.write()
             .map_err(|_| ServerError::InvalidSession)?;
@@ -972,9 +1062,16 @@ impl SecuroServ {
             return Err(ServerError::InvalidNonce);
         }
         
-        // Decrypt with the session's client key
-        let salsa_box = SalsaBox::new(&session_data.public_key, &self.secret_key);
-        let plaintext = salsa_box.decrypt(&nonce, ciphertext.as_ref())
+        let cipher = ChaCha20Poly1305::new_from_slice(&session_data.session_key)
+            .map_err(|_| ServerError::DecryptionFailed)?;
+        let mut nonce_array = [0u8; 12];
+        nonce_array.copy_from_slice(&nonce_bytes);
+        let nonce = ChaNonce::from(nonce_array);
+        let ts_aad = req.timestamp.to_le_bytes();
+        let plaintext = cipher.decrypt(&nonce, Payload {
+            msg: ciphertext.as_ref(),
+            aad: &ts_aad,
+        })
             .map_err(|_| ServerError::DecryptionFailed)?;
 
         let plaintext_str = String::from_utf8(plaintext)
@@ -998,39 +1095,45 @@ impl SecuroServ {
         response_payload: serde_json::Value,
     ) -> Result<EncryptedResponse, ServerError> {
         let session_uuid = self.validate_any_token(session_id, &["access", "exchange"])?;
-        let session_id_str = session_uuid.to_string();
+        let sessions = self.sessions.read()
+            .map_err(|_| ServerError::InvalidSession)?;
+        let session_data = sessions.get(&session_uuid)
+            .ok_or(ServerError::SessionNotFound)?;
 
-        // Get client public key from session
-        let client_public_key = self.get_client_key(&session_id_str)?;
-
-        // Create box with client's public key
-        let salsa_box = self.create_box_with_client(&client_public_key);
-
-        // Generate a random nonce
-        let nonce = SalsaBox::generate_nonce(&mut OsRng);
+        let cipher = ChaCha20Poly1305::new_from_slice(&session_data.session_key)
+            .map_err(|_| ServerError::EncryptionFailed)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = ChaNonce::from(nonce_bytes);
 
         // Encrypt response payload as JSON
         let plaintext = serde_json::to_vec(&response_payload)
             .map_err(|_| ServerError::EncryptionFailed)?;
 
-        let ciphertext = salsa_box
-            .encrypt(&nonce, plaintext.as_ref())
+        let ts_aad = timestamp.to_le_bytes();
+        let ciphertext = cipher
+            .encrypt(&nonce, Payload {
+                msg: plaintext.as_ref(),
+                aad: &ts_aad,
+            })
             .map_err(|_| ServerError::EncryptionFailed)?;
 
-        // Sign the response: nonce || ciphertext (both base64)
-        let nonce_b64 = BASE64_URL_SAFE.encode(&nonce[..]);
+        // Sign the response: nonce || timestamp || ciphertext (all serialized text)
+        let nonce_b64 = BASE64_URL_SAFE.encode(nonce_bytes);
         let ciphertext_b64 = BASE64_URL_SAFE.encode(&ciphertext);
+        let timestamp_s = timestamp.to_string();
         let mut sig_message = Vec::new();
         sig_message.extend_from_slice(nonce_b64.as_bytes());
+        sig_message.extend_from_slice(b"||");
+        sig_message.extend_from_slice(timestamp_s.as_bytes());
         sig_message.extend_from_slice(b"||");
         sig_message.extend_from_slice(ciphertext_b64.as_bytes());
         let sig_bytes = self.sign_data(&sig_message);
         let signature = BASE64_URL_SAFE.encode(&sig_bytes);
-
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
 
         ldebug!(self.logger, "Response encrypted and signed successfully with timestamp: {}", timestamp);
 

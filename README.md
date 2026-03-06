@@ -6,7 +6,7 @@
   <img src="https://raw.githubusercontent.com/louislafosse/securo/refs/heads/main/docs/logo_def.png" alt="Securo Logo" width="500"/>
   
   <p><strong>A hybrid post-quantum end-to-end encryption implementation using Securo:
-  </br>Ephemeral X25519 + Kyber-1024 key exchange, XSalsa20-Poly1305 AEAD encryption, Ed25519 signatures, Certificate (TLS 1.3) pinning (SPKI based), replay protection.
+  </br>HKDF-SHA256 hybrid key derivation from X25519 + Kyber-1024, SalsaBox (XSalsa20-Poly1305) bootstrap encryption, ChaCha20-Poly1305 session AEAD, Ed25519 signatures, Certificate (TLS 1.3) pinning (SPKI based), replay protection.
   </br></br>Server and Client included using Actix & Diesel Frameworks</strong></p>
 
   [![Crates.io](https://img.shields.io/crates/v/securo.svg)](https://crates.io/crates/securo)

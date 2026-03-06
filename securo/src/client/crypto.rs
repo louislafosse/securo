@@ -2,12 +2,18 @@ use crypto_box::{
     aead::{Aead, AeadCore, OsRng},
     PublicKey, SalsaBox, SecretKey,
 };
+use chacha20poly1305::{
+    ChaCha20Poly1305,
+    Nonce as ChaNonce,
+    aead::{KeyInit, Payload},
+};
 use serde::{Deserialize, Serialize};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE};
 use ed25519_dalek::{SigningKey, VerifyingKey, Signature, Verifier};
-use pqc_kyber::{keypair, decapsulate};
+use pqc_kyber::{RngCore, decapsulate, keypair};
 use std::time::{SystemTime, UNIX_EPOCH};
 use hmac::{Hmac, Mac};
+use hkdf::Hkdf;
 use sha2::Sha256;
 use crate::logger::linfo;
 
@@ -17,7 +23,7 @@ const KYBER_1024_CIPHERTEXT_SIZE: usize = 1568;  // Kyber-1024 encapsulation pro
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EncryptedMessage {
     pub session_id: String,        // UUID - identifies the client session
-    pub nonce: String,              // 24 random bytes
+    pub nonce: String,              // 12 random bytes (ChaCha20Poly1305)
     pub ciphertext: String,         // contains encrypted JSON payload
     pub signature: String,          // Ed25519 signature over (session_id || nonce || ciphertext)
     pub timestamp: i64,
@@ -63,9 +69,12 @@ pub struct SecuroClient {
     kyber_secret_key: Vec<u8>,
     kyber_public_key: Vec<u8>,
     kyber_shared_secret: Option<Vec<u8>>,  // Decapsulated shared secret from server
+    session_key: Option<[u8; 32]>,         // Hybrid session key derived from X25519 + Kyber
     
     server_public_key: Option<PublicKey>,
     server_verifying_key: Option<VerifyingKey>,  // Server's Ed25519 key for response verification
+    stage1_server_ephemeral_b64: Option<String>,
+    stage1_server_signature_b64: Option<String>,
     session_id: Option<String>,
     logger: crate::logger::LoggerHandle,
 }
@@ -109,8 +118,11 @@ impl SecuroClient {
             kyber_secret_key: kyber_kp.secret.to_vec(),
             kyber_public_key: kyber_kp.public.to_vec(),
             kyber_shared_secret: None,
+            session_key: None,
             server_public_key: None,
             server_verifying_key: None,
+            stage1_server_ephemeral_b64: None,
+            stage1_server_signature_b64: None,
             session_id: None,
             logger
         }
@@ -181,7 +193,7 @@ impl SecuroClient {
     /// Decapsulate Kyber ciphertext to derive post-quantum shared secret
     pub fn decapsulate_kyber(&mut self, kyber_ciphertext_b64: &str) -> Result<(), Box<dyn std::error::Error>> {
         if kyber_ciphertext_b64.is_empty() {
-            return Ok(());  // No Kyber ciphertext provided
+            return Err("Kyber ciphertext is required".into());
         }
         
         let ciphertext = BASE64_URL_SAFE.decode(kyber_ciphertext_b64)?;
@@ -208,7 +220,7 @@ impl SecuroClient {
         
         self.kyber_shared_secret = Some(shared_secret.to_vec());
 
-        linfo!(self.logger, "Kyber-1024 shared secret established");        
+        self.derive_session_key()?;
         Ok(())
     }
 
@@ -222,7 +234,7 @@ impl SecuroClient {
             let encrypted_bytes = BASE64_URL_SAFE.decode(encrypted_verifying_key_b64)?;
 
             // Compute HMAC of encrypted verifying key using Kyber shared secret
-            let mut mac = Hmac::<Sha256>::new_from_slice(kyber_ss)
+            let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(kyber_ss)
                 .map_err(|_| "Failed to create HMAC")?;
             mac.update(&encrypted_bytes);
             
@@ -245,6 +257,44 @@ impl SecuroClient {
             .ok_or("Server public key not set")?;
         
         Ok(SalsaBox::new(server_public_key, &self.static_secret_key))
+    }
+
+    /// Derive hybrid session key from X25519 + Kyber shared secrets using HKDF-SHA256.
+    fn derive_session_key(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let server_public = self.server_public_key.as_ref()
+            .ok_or("Server public key not set")?;
+        let stage1_ephemeral_b64 = self.stage1_server_ephemeral_b64.as_ref()
+            .ok_or("Missing Stage 1 server ephemeral for hybrid derivation")?;
+        let kyber_ss = self.kyber_shared_secret.as_ref()
+            .ok_or("Kyber shared secret not available")?;
+
+        let static_secret = x25519_dalek::StaticSecret::from(self.static_secret_key.to_bytes());
+        let server_x25519_pub = x25519_dalek::PublicKey::from(*server_public.as_bytes());
+        let static_shared = static_secret.diffie_hellman(&server_x25519_pub);
+
+        let stage1_ephemeral_bytes = BASE64_URL_SAFE.decode(stage1_ephemeral_b64)?;
+        if stage1_ephemeral_bytes.len() != 32 {
+            return Err("Stage 1 server ephemeral invalid length".into());
+        }
+        let mut stage1_ephemeral_array = [0u8; 32];
+        stage1_ephemeral_array.copy_from_slice(&stage1_ephemeral_bytes);
+        let stage1_ephemeral_pub = x25519_dalek::PublicKey::from(stage1_ephemeral_array);
+        let ephemeral_shared = static_secret.diffie_hellman(&stage1_ephemeral_pub);
+
+        let mut combined_secret = Vec::with_capacity(
+            static_shared.as_bytes().len() + ephemeral_shared.as_bytes().len() + kyber_ss.len()
+        );
+        combined_secret.extend_from_slice(static_shared.as_bytes());
+        combined_secret.extend_from_slice(ephemeral_shared.as_bytes());
+        combined_secret.extend_from_slice(kyber_ss);
+
+        let hkdf = Hkdf::<Sha256>::new(Some(b"securo-v2-session"), &combined_secret);
+        let mut session_key = [0u8; 32];
+        hkdf.expand(b"chacha20-encryption", &mut session_key)
+            .map_err(|_| "HKDF expand failed")?;
+
+        self.session_key = Some(session_key);
+        Ok(())
     }
 
     /// Get the client's static X25519 secret key
@@ -286,7 +336,10 @@ impl SecuroClient {
         session_id: &str,
         payload: serde_json::Value,
     ) -> Result<EncryptedRequest, Box<dyn std::error::Error>> {
-        let salsa_box = self.create_box()?;
+        let session_key = self.session_key.as_ref()
+            .ok_or("Session key not derived - call decapsulate_kyber first")?;
+        let cipher = ChaCha20Poly1305::new_from_slice(session_key)
+            .map_err(|_| "Invalid session key length")?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -299,17 +352,20 @@ impl SecuroClient {
 
         let plaintext = serde_json::to_vec(&inner_payload)?;
 
-        // Generate a random nonce
-        let nonce = SalsaBox::generate_nonce(&mut OsRng);
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = ChaNonce::from(nonce_bytes);
 
-        // Encrypt
-        let ciphertext = salsa_box
-            .encrypt(&nonce, plaintext.as_ref())
-            .map_err(|e| format!("Encryption failed: {:?}", e))?;
+        let ts_aad = now.to_le_bytes();
+        let ciphertext = cipher.encrypt(&nonce, Payload {
+            msg: plaintext.as_ref(),
+            aad: &ts_aad,
+        })
+            .map_err(|_| "Encryption failed")?;
 
         Ok(EncryptedRequest {
             session_id: session_id.to_string(),
-            nonce: BASE64_URL_SAFE.encode(&nonce[..]),
+            nonce: BASE64_URL_SAFE.encode(nonce_bytes),
             ciphertext: BASE64_URL_SAFE.encode(&ciphertext),
             timestamp: now,
         })
@@ -362,11 +418,70 @@ impl SecuroClient {
         
         // Store server verifying key for later response verification
         self.server_verifying_key = Some(verifying_key);
+        // Keep Stage 1 values so process_stage2_response can re-verify with authenticated key.
+        self.stage1_server_ephemeral_b64 = Some(server_ephemeral_b64.to_string());
+        self.stage1_server_signature_b64 = Some(server_signature_b64.to_string());
         
         // Construct and return ephemeral public key
         let mut key_array = [0u8; 32];
         key_array.copy_from_slice(&server_ephemeral_bytes);
         Ok(PublicKey::from(key_array))
+    }
+
+    /// Stage 2 - finalize server verifying key using Kyber-authenticated payload.
+    /// Verifies HMAC, decrypts the verifying key, and stores it for all future response checks.
+    pub fn finalize_server_verifying_key_stage2(
+        &mut self,
+        encrypted_verifying_key_b64: &str,
+        verifying_key_hmac_b64: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if encrypted_verifying_key_b64.is_empty() {
+            return Err("Missing encrypted_verifying_key in stage 2 response".into());
+        }
+        if verifying_key_hmac_b64.is_empty() {
+            return Err("Missing verifying_key_hmac in stage 2 response".into());
+        }
+
+        self.verify_verifying_key_hmac(encrypted_verifying_key_b64, verifying_key_hmac_b64)?;
+        let decrypted_vk = self.decrypt_verifying_key(encrypted_verifying_key_b64)?;
+        if decrypted_vk.len() != 32 {
+            return Err("Decrypted verifying key invalid length".into());
+        }
+
+        let verifying_key = VerifyingKey::from_bytes((&decrypted_vk[..32]).try_into()?)?;
+        self.server_verifying_key = Some(verifying_key);
+        Ok(())
+    }
+
+    /// Re-verify Stage 1 signature using the authenticated server verifying key.
+    pub fn verify_stage1_signature_with_authenticated_key(
+        &self,
+        server_ephemeral_b64: &str,
+        server_signature_b64: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let verifying_key = self.server_verifying_key.as_ref()
+            .ok_or("Authenticated server verifying key not set")?;
+
+        let server_ephemeral_bytes = BASE64_URL_SAFE.decode(server_ephemeral_b64)?;
+        if server_ephemeral_bytes.len() != 32 {
+            return Err("Server ephemeral key invalid length".into());
+        }
+
+        let signature_bytes = BASE64_URL_SAFE.decode(server_signature_b64)?;
+        if signature_bytes.len() != 64 {
+            return Err("Signature invalid length".into());
+        }
+
+        let mut sig_array = [0u8; 64];
+        sig_array.copy_from_slice(&signature_bytes);
+        let signature = Signature::from_bytes(&sig_array);
+
+        let mut sig_message = Vec::with_capacity(64);
+        sig_message.extend_from_slice(verifying_key.as_bytes());
+        sig_message.extend_from_slice(&server_ephemeral_bytes);
+        verifying_key.verify(&sig_message, &signature)?;
+
+        Ok(())
     }
 
     /// Stage 2 - Create encrypted payload with client keys
@@ -431,8 +546,8 @@ impl SecuroClient {
         Ok(response_json)
     }
 
-    /// Stage 2 - Extract and process temp JWT from stage 2 response
-    /// Also decapsulates Kyber ciphertext if present
+    /// Stage 2 - Extract and process temp JWT from stage 2 response.
+    /// Also decapsulates required Kyber ciphertext.
     pub fn process_stage2_response(
         &mut self,
         response_json: &serde_json::Value,
@@ -446,11 +561,24 @@ impl SecuroClient {
         // Set as session ID
         self.set_session_id(temp_jwt.clone());
         
-        // Decapsulate Kyber ciphertext if present
-        if let Some(kyber_ct) = response_json.get("kyber_ciphertext").and_then(|v| v.as_str())
-            && !kyber_ct.is_empty() {
-                self.decapsulate_kyber(kyber_ct)?;
-            }
+        let encrypted_verifying_key = response_json.get("encrypted_verifying_key")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing encrypted_verifying_key in stage 2 response")?;
+        let verifying_key_hmac = response_json.get("verifying_key_hmac")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing verifying_key_hmac in stage 2 response")?;
+
+        let kyber_ct = response_json.get("kyber_ciphertext")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing kyber_ciphertext in stage 2 response")?;
+        self.decapsulate_kyber(kyber_ct)?;
+
+        self.finalize_server_verifying_key_stage2(encrypted_verifying_key, verifying_key_hmac)?;
+        let stage1_ephemeral = self.stage1_server_ephemeral_b64.as_deref()
+            .ok_or("Missing Stage 1 server ephemeral context")?;
+        let stage1_signature = self.stage1_server_signature_b64.as_deref()
+            .ok_or("Missing Stage 1 server signature context")?;
+        self.verify_stage1_signature_with_authenticated_key(stage1_ephemeral, stage1_signature)?;
         
         Ok(temp_jwt)
     }
@@ -462,9 +590,11 @@ impl SecuroClient {
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {        
         // Verify signature first if server key is set
         if let Some(verifying_key) = &self.server_verifying_key {
-            // Reconstruct the message that was signed: nonce || ciphertext
+            // Reconstruct the message that was signed: nonce || timestamp || ciphertext
             let mut sig_message = Vec::new();
             sig_message.extend_from_slice(response.nonce.as_bytes());
+            sig_message.extend_from_slice(b"||");
+            sig_message.extend_from_slice(response.timestamp.to_string().as_bytes());
             sig_message.extend_from_slice(b"||");
             sig_message.extend_from_slice(response.ciphertext.as_bytes());
             
@@ -495,24 +625,28 @@ impl SecuroClient {
                 time_diff, TTL_WINDOW
             ).into());
         }
-        
-        let salsa_box = self.create_box()?;
+
+        let session_key = self.session_key.as_ref()
+            .ok_or("Session key not derived")?;
+        let cipher = ChaCha20Poly1305::new_from_slice(session_key)
+            .map_err(|_| "Invalid session key length")?;
 
         let nonce_bytes = BASE64_URL_SAFE.decode(&response.nonce)?;
         let ciphertext = BASE64_URL_SAFE.decode(&response.ciphertext)?;
 
-        if nonce_bytes.len() != 24 {
-            return Err("Invalid nonce length".into());
+        if nonce_bytes.len() != 12 {
+            return Err("Invalid nonce length for ChaCha20Poly1305".into());
         }
 
-        let mut nonce_array = [0u8; 24];
+        let mut nonce_array = [0u8; 12];
         nonce_array.copy_from_slice(&nonce_bytes);
-        let nonce = crypto_box::Nonce::from(nonce_array);
-
-        // Decrypt
-        let plaintext = salsa_box
-            .decrypt(&nonce, ciphertext.as_ref())
-            .map_err(|e| format!("Decryption failed: {:?}", e))?;
+        let nonce = ChaNonce::from(nonce_array);
+        let ts_aad = response.timestamp.to_le_bytes();
+        let plaintext = cipher.decrypt(&nonce, Payload {
+            msg: ciphertext.as_ref(),
+            aad: &ts_aad,
+        })
+            .map_err(|_| "Decryption failed")?;
 
         let plaintext_str = String::from_utf8(plaintext)?;
         let response_payload: serde_json::Value = serde_json::from_str(&plaintext_str)?;

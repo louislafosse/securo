@@ -1,4 +1,4 @@
-use securo::client::crypto::{SecuroClient, EncryptedResponse};
+use securo::client::crypto::{EncryptedResponse, SecuroClient};
 
 #[allow(dead_code)]
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -136,8 +136,17 @@ pub async fn exchange_keys_stage2(
 
     // CRYPTO: Extract temp JWT and process response (including Kyber decapsulation)
     let temp_jwt = crypto.process_stage2_response(&response_json)?;
+
+    let encrypted_verifying_key = response_json.get("encrypted_verifying_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let verifying_key_hmac = response_json.get("verifying_key_hmac")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     
-    // Extract kyber ciphertext for response (can be empty string if not provided)
+    // Extract Kyber ciphertext for response display/logging
     let kyber_ciphertext = response_json.get("kyber_ciphertext")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -156,8 +165,8 @@ pub async fn exchange_keys_stage2(
         server_public_key: stage1_response.server_x25519_public,
         server_ephemeral_public: stage1_response.server_ephemeral_public,
         server_signature: stage1_response.server_signature,
-        encrypted_verifying_key: String::new(),
-        verifying_key_hmac: String::new(),
+        encrypted_verifying_key,
+        verifying_key_hmac,
         kyber_ciphertext,
         temp_jwt,
         token_type,
